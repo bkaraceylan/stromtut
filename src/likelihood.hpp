@@ -6,6 +6,7 @@
 #include <boost/shared_ptr.hpp>
 #include <boost/range/adaptor/reversed.hpp>
 #include <libhmsbeagle/beagle.h>
+#include "model.hpp"
 #include "tree.hpp"
 #include "data.hpp"
 #include "xstrom.hpp"
@@ -41,6 +42,9 @@ namespace strom {
             unsigned                                calcNumEdgesInFullyResolvedTree() const;
             unsigned                                calcNumInternalsInFullyResolvedTree() const;
 
+			Model::SharedPtr                        getModel();                     
+            void                                    setModel(Model::SharedPtr m);   
+
         private:
         
             struct InstanceInfo {
@@ -52,9 +56,10 @@ namespace strom {
                 unsigned npatterns;
                 unsigned partial_offset;
                 unsigned tmatrix_offset;
+				bool	 invarmodel;
                 std::vector<unsigned> subsets;
                 
-                InstanceInfo() : handle(-1), resourcenumber(-1), resourcename(""), nstates(0), nratecateg(0), npatterns(0), partial_offset(0), tmatrix_offset(0) {}
+				InstanceInfo() : handle(-1), resourcenumber(-1), resourcename(""), nstates(0), nratecateg(0), npatterns(0), partial_offset(0), tmatrix_offset(0), invarmodel(false) {}
             };
 
             typedef std::pair<unsigned, int>        instance_pair_t;
@@ -77,7 +82,6 @@ namespace strom {
             void                                    updateTransitionMatrices();
             void                                    calculatePartials();
             double                                  calcInstanceLogLikelihood(InstanceInfo & inst, Tree::SharedPtr t);
-
 
             std::vector<InstanceInfo>               _instances;
             std::map<int, std::string>              _beagle_error;
@@ -103,6 +107,8 @@ namespace strom {
             bool                                    _ambiguity_equals_missing;
             bool                                    _using_data;
 
+			Model::SharedPtr                        _model;
+			
         public:
             typedef std::shared_ptr< Likelihood >   SharedPtr;
     }; 
@@ -168,7 +174,8 @@ namespace strom {
         _weights_indices.assign(1, 0);
         _freqs_indices.assign(1, 0);
         _scaling_indices.assign(1, 0);
-        
+		_model = Model::SharedPtr(new Model());       
+ 
         // Store BeagleLib error codes so that useful
         // error messages may be provided to the user
         _beagle_error.clear();
@@ -247,6 +254,7 @@ namespace strom {
 
 	inline void Likelihood::initBeagleLib() {  
         assert(_data);
+		assert(_model);
 
         // Close down any existing BeagleLib instances
         finalizeBeagleLib(true);
@@ -259,7 +267,9 @@ namespace strom {
         for (unsigned subset = 0; subset < nsubsets; subset++) {
             // Create a pair comprising number of states and number of rate categories
             unsigned nstates = _data->getNumStatesForSubset(subset);
-            int nrates = 1; // assuming no rate heterogeneity for now
+			bool invar_model = _model->getSubsetIsInvarModel(subset);
+            int nrates = (invar_model ? -1 : 1)*_model->getSubsetNumCateg(subset);
+
             instance_pair_t p = std::make_pair(nstates, nrates);
             
             // Add combo to set
@@ -273,7 +283,7 @@ namespace strom {
             newInstance(p.first, p.second, subsets_for_pair[p]);
             
             InstanceInfo & info = *_instances.rbegin();
-            std::cout << boost::str(boost::format("Created BeagleLib instance %d (%d states, %d rate%s, %d subset%s)") % info.handle % info.nstates % info.nratecateg % (info.nratecateg == 1 ? "" : "s") % info.subsets.size() % (info.subsets.size() == 1 ? "" : "s")) << std::endl;
+			 std::cout << boost::str(boost::format("Created BeagleLib instance %d (%d states, %d rate%s, %d subset%s, %s invar. sites model)") % info.handle % info.nstates % info.nratecateg % (info.nratecateg == 1 ? "" : "s") % info.subsets.size() % (info.subsets.size() == 1 ? "" : "s") % (info.invarmodel ? "is" : "not")) << std::endl;
         }
         
         if (_ambiguity_equals_missing)
@@ -286,8 +296,9 @@ namespace strom {
 
 	inline void Likelihood::newInstance(unsigned nstates, int nrates, std::vector<unsigned> & subset_indices) {  
         unsigned num_subsets = (unsigned)subset_indices.size();
-        
-        unsigned ngammacat = (unsigned)nrates;
+
+		bool is_invar_model = (nrates < 0 ? true : false);
+        unsigned ngammacat = (unsigned)(is_invar_model ? -nrates : nrates);
         
         unsigned num_patterns = 0;
         for (auto s : subset_indices) {
@@ -345,6 +356,7 @@ namespace strom {
         info.resourcename   = instance_details.resourceName;
         info.nstates        = nstates;
         info.nratecateg     = ngammacat;
+		info.invarmodel     = is_invar_model;
         info.subsets        = subset_indices;
         info.npatterns      = num_patterns;
         info.partial_offset = num_internals;
@@ -426,8 +438,6 @@ namespace strom {
         Data::state_t one = 1;
         
         for (auto & info : _instances) {
-            if (info.nstates != 4)  
-                throw XStrom(boost::format("This program can handle only 4-state DNA/RNA data. You specified data having %d states for at least one data subset.") % info.nstates);  
 
             std::vector<double> partials(info.nstates*info.npatterns);
             
@@ -549,90 +559,51 @@ namespace strom {
         assert(_instances.size() > 0);
         int code = 0;
         
-        // For now we are assuming rates among sites are equal
-        double rates[1] = {1.0};
-        double probs[1] = {1.0};
-
         // Loop through all instances
         for (auto & info : _instances) {
 
             // Loop through all subsets assigned to this instance
-            for (unsigned instance_specific_subset_index = 0; instance_specific_subset_index < info.subsets.size(); instance_specific_subset_index++) {
-            
-                code = beagleSetCategoryRatesWithIndex(
-                    info.handle,                    // instance number
-                    instance_specific_subset_index, // subset index
-                    rates);                         // vector containing rate scalers
+            unsigned instance_specific_subset_index = 0;
+            for (unsigned s : info.subsets) {
+                code = _model->setBeagleAmongSiteRateVariationRates(info.handle, s, instance_specific_subset_index);
                 if (code != 0)
                     throw XStrom(boost::str(boost::format("Failed to set category rates for BeagleLib instance %d. BeagleLib error code was %d (%s)") % info.handle % code % _beagle_error[code]));
-
-                code = beagleSetCategoryWeights(
-                    info.handle,                    // Instance number
-                    instance_specific_subset_index, // Index of category weights buffer
-                    probs);                         // Category weights array (categoryCount)
+            
+                code = _model->setBeagleAmongSiteRateVariationProbs(info.handle, s, instance_specific_subset_index);
                 if (code != 0)
                     throw XStrom(boost::str(boost::format("Failed to set category probabilities for BeagleLib instance %d. BeagleLib error code was %d (%s)") % info.handle % code % _beagle_error[code]));
+                    
+                ++instance_specific_subset_index;
             }
         }
-    }
+    }   
 
-	inline void Likelihood::setModelRateMatrix() {  
-        assert(_instances.size() > 0);
-        int code = 0;
-        double state_freqs[4] = {0.25, 0.25, 0.25, 0.25};
-        
-        double eigenvalues[4] = {
-            -4.0/3.0,
-            -4.0/3.0,
-            -4.0/3.0,
-            0.0
-            };
-
-        double eigenvectors[16] = {
-            -1,   -1,  -1,  1,
-             0,    0,   1,  1,
-             0,    1,   0,  1,
-             1,    0,   0,  1
-            };
-
-        double inverse_eigenvectors[16] = {
-            -0.25,   -0.25,   -0.25,   0.75,
-            -0.25,   -0.25,    0.75,  -0.25,
-            -0.25,    0.75,   -0.25,  -0.25,
-             0.25,    0.25,    0.25,   0.25
-            };
-
+	inline void Likelihood::setModelRateMatrix() { 
         // Loop through all instances
         for (auto & info : _instances) {
 
             // Loop through all subsets assigned to this instance
-            for (unsigned instance_specific_subset_index = 0; instance_specific_subset_index < info.subsets.size(); instance_specific_subset_index++) {
-
-                code = beagleSetStateFrequencies(
-                     info.handle,                       // Instance number
-                     instance_specific_subset_index,    // Index of state frequencies buffer
-                     state_freqs);                      // State frequencies array (stateCount)
+            unsigned instance_specific_subset_index = 0;
+            for (unsigned s : info.subsets) {
+                int code = _model->setBeagleStateFrequencies(info.handle, s, instance_specific_subset_index);
                 if (code != 0)
                     throw XStrom(boost::str(boost::format("Failed to set state frequencies for BeagleLib instance %d. BeagleLib error code was %d (%s)") % info.handle % code % _beagle_error[code]));
 
-                 code = beagleSetEigenDecomposition(
-                    info.handle,                            // Instance number
-                    instance_specific_subset_index,         // Index of eigen-decomposition buffer
-                    (const double *)eigenvectors,           // Flattened matrix (stateCount x stateCount) of eigenvectors
-                    (const double *)inverse_eigenvectors,   // Flattened matrix (stateCount x stateCount) of inverse-eigenvectors
-                    eigenvalues);                           // Vector of eigenvalues
+                code = _model->setBeagleEigenDecomposition(info.handle, s, instance_specific_subset_index);
                 if (code != 0)
                     throw XStrom(boost::str(boost::format("Failed to set eigen decomposition for BeagleLib instance %d. BeagleLib error code was %d (%s)") % info.handle % code % _beagle_error[code]));
+                
+                ++instance_specific_subset_index;
             }
         }
-    }
+    } 
 
 	inline void Likelihood::defineOperations(Tree::SharedPtr t) {   
         assert(_instances.size() > 0);
         assert(t);
         assert(t->isRooted() == _rooted);
         
-        _relrate_normalizing_constant = 1.0; // assuming subset rates all 1.0 for now
+		_relrate_normalizing_constant = _model->calcNormalizingConstantForSubsetRelRates();		
 
         // Start with a clean slate
         for (auto & info : _instances) {
@@ -666,10 +637,12 @@ namespace strom {
     }
 
 	inline void Likelihood::queueTMatrixRecalculation(Node * nd) {  
-        double subset_relative_rate = 1.0;  // assuming all subsets have equal relative rates for now
+		Model::subset_relrate_vect_t & subset_relrates = _model->getSubsetRelRates();
         for (auto & info : _instances) {
             unsigned instance_specific_subset_index = 0;
             for (unsigned s : info.subsets) {
+				double subset_relative_rate = subset_relrates[s]/_relrate_normalizing_constant;
+
                 unsigned tindex = getTMatrixIndex(nd, info, instance_specific_subset_index);
                 _pmatrix_index[info.handle].push_back(tindex);
                 _edge_lengths[info.handle].push_back(nd->_edge_length*subset_relative_rate);
@@ -784,6 +757,15 @@ namespace strom {
         } 
     }
 
+	inline Model::SharedPtr Likelihood::getModel() {  
+        return _model;
+    }
+    
+    inline void Likelihood::setModel(Model::SharedPtr m) {
+        assert(_instances.size() == 0); // can't change model after initBeagleLib called
+        _model = m;
+    }   
+
 	inline void Likelihood::calculatePartials() {  
         assert(_instances.size() > 0);
         if (_operations.size() == 0)
@@ -888,6 +870,68 @@ namespace strom {
 
         if (code != 0)
             throw XStrom(boost::str(boost::format("failed to calculate edge logLikelihoods in CalcLogLikelihood. BeagleLib error code was %d (%s)") % code % _beagle_error[code]));
+	
+		if (info.invarmodel) {
+            auto monomorphic = _data->getMonomorphic();
+            auto counts = _data->getPatternCounts();
+            std::vector<double> site_log_likelihoods(info.npatterns, 0.0);
+            double * siteLogLs = &site_log_likelihoods[0];
+
+
+            beagleGetSiteLogLikelihoods(info.handle, siteLogLs);
+
+
+            // Loop through all subsets assigned to this instance
+            double lnL = 0.0;
+            unsigned i = 0;
+            for (unsigned s : info.subsets) {
+                const ASRV & asrv = _model->getASRV(s);
+                const QMatrix & qmatrix = _model->getQMatrix(s);
+                const double * freq = qmatrix.getStateFreqs();
+                
+
+                double pinvar = *(asrv.getPinvarSharedPtr());
+                assert(pinvar >= 0.0 && pinvar <= 1.0);
+
+
+                if (pinvar == 0.0) {
+                    // log likelihood for this subset is equal to the sum of site log-likelihoods
+                    auto interval = _data->getSubsetBeginEnd(s);
+                    for (unsigned p = interval.first; p < interval.second; p++) {
+                        lnL += counts[p]*site_log_likelihoods[i++];
+                    }
+                }
+                else {
+                    // Loop through all patterns in this subset
+                    double log_pinvar = log(pinvar);
+                    double log_one_minus_pinvar = log(1.0 - pinvar);
+                    auto interval = _data->getSubsetBeginEnd(s);
+                    for (unsigned p = interval.first; p < interval.second; p++) {
+                        // Loop through all states for this pattern
+                        double invar_like = 0.0;
+                        if (monomorphic[p] > 0) {
+                            for (unsigned k = 0; k < info.nstates; ++k) {
+                                Data::state_t x = (Data::state_t)1 << k;
+                                double condlike = (x & monomorphic[p] ? 1.0 : 0.0);
+                                double basefreq = freq[k];
+                                invar_like += condlike*basefreq;
+                            }
+                        }
+                        double site_lnL = site_log_likelihoods[i++];
+                        double log_like_term = log_one_minus_pinvar + site_lnL;
+                        if (invar_like > 0.0) {
+                            double log_invar_term = log_pinvar + log(invar_like);
+                            double site_log_like = (log_like_term + log(1.0 + exp(log_invar_term - log_like_term)));
+                            lnL += counts[p]*site_log_like;
+                        }
+                        else {
+                            lnL += counts[p]*log_like_term;
+                        }
+                    }
+                }
+            }
+            log_likelihood = lnL;
+        }
 
         return log_likelihood;
     }
@@ -900,6 +944,7 @@ namespace strom {
 
         // Must call setData before calcLogLikelihood
         assert(_data);
+		assert(_model);
 
         if (t->_is_rooted)
             throw XStrom("This version of the program can only compute likelihoods for unrooted trees");
@@ -917,7 +962,8 @@ namespace strom {
         for (auto & info : _instances) {
             log_likelihood += calcInstanceLogLikelihood(info, t);
         }
-        
+	
+		        
         return log_likelihood;
     }
 
