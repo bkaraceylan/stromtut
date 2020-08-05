@@ -24,6 +24,7 @@ namespace strom {
 
             bool                                    usingStoredData() const;
             void                                    useStoredData(bool using_data);
+            void                                    useUnderflowScaling(bool do_scaling);
 
             std::string                             beagleLibVersion() const;
             std::string                             availableResources() const;
@@ -105,6 +106,7 @@ namespace strom {
             bool                                    _rooted;
             bool                                    _prefer_gpu;
             bool                                    _ambiguity_equals_missing;
+            bool                                    _underflow_scaling;
             bool                                    _using_data;
 
 			Model::SharedPtr                        _model;
@@ -158,6 +160,7 @@ namespace strom {
         _rooted                     = false;
         _prefer_gpu                 = false;
         _ambiguity_equals_missing   = true;
+        _underflow_scaling          = false;
         _using_data                 = true;
         _data                       = nullptr;
         
@@ -246,7 +249,11 @@ namespace strom {
 
 	inline void Likelihood::useStoredData(bool using_data) {  
         _using_data = using_data;
-    }  
+    }
+
+    inline void Likelihood::useUnderflowScaling(bool uf_scaler) {
+        _underflow_scaling = uf_scaler;
+    } 
 
 	inline bool Likelihood::usingStoredData() const {   
         return _using_data;
@@ -314,6 +321,10 @@ namespace strom {
         long requirementFlags = 0;
 
         long preferenceFlags = BEAGLE_FLAG_PRECISION_SINGLE | BEAGLE_FLAG_THREADING_CPP;
+        if (_underflow_scaling) {
+            preferenceFlags |= BEAGLE_FLAG_SCALING_MANUAL;
+            preferenceFlags |= BEAGLE_FLAG_SCALERS_LOG;
+        } 
         if (_prefer_gpu)
             preferenceFlags |= BEAGLE_FLAG_PROCESSOR_GPU;
         else
@@ -321,6 +332,7 @@ namespace strom {
         
         BeagleInstanceDetails instance_details;
         unsigned npartials = num_internals + _ntaxa;
+		unsigned nscalers = num_internals;  // one scale buffer for every internal node
         unsigned nsequences = 0;
         if (_ambiguity_equals_missing) {
             npartials -= _ntaxa;
@@ -328,20 +340,20 @@ namespace strom {
         }
         
         int inst = beagleCreateInstance(
-             _ntaxa,                           // tips
-             npartials,                        // partials
-             nsequences,                       // sequences
-             nstates,                          // states
-             num_patterns,                     // patterns (total across all subsets that use this instance)
-             num_subsets,                      // models (one for each distinct eigen decomposition)
-             num_subsets*num_transition_probs, // transition matrices (one for each node in each subset)
-             ngammacat,                        // rate categories
-             0,                                // scale buffers
-             NULL,                             // resource restrictions
-             0,                                // length of resource list
-             preferenceFlags,                  // preferred flags
-             requirementFlags,                 // required flags
-             &instance_details);               // pointer for details
+             _ntaxa,                           			// tips
+             npartials,                        			// partials
+             nsequences,                       			// sequences
+             nstates,                          			// states
+             num_patterns,                     			// patterns (total across all subsets that use this instance)
+             num_subsets,                      			// models (one for each distinct eigen decomposition)
+             num_subsets*num_transition_probs, 			// transition matrices (one for each node in each subset)
+             ngammacat,                        			// rate categories
+            (_underflow_scaling ? nscalers + 1 : 0),	// scale buffers  (+1 is for the cumulative scaler at index 0)
+             NULL,                             			// resource restrictions
+             0,                                			// length of resource list
+             preferenceFlags,                  			// preferred flags
+             requirementFlags,                 			// required flags
+             &instance_details);               			// pointer for details
         
         if (inst < 0) {
             // beagleCreateInstance returns one of the following:
@@ -717,7 +729,10 @@ namespace strom {
     }   
 
 	inline unsigned Likelihood::getScalerIndex(Node * nd, InstanceInfo & info) const {  
-        return BEAGLE_OP_NONE;
+		unsigned sindex = BEAGLE_OP_NONE;
+        if (_underflow_scaling)
+            sindex = nd->_number - _ntaxa + 1; // +1 to skip the cumulative scaler vector
+        return sindex;
     }   
 
 	inline void Likelihood::updateTransitionMatrices() {    
@@ -797,7 +812,8 @@ namespace strom {
         } 
     }
 
-	inline double Likelihood::calcInstanceLogLikelihood(InstanceInfo & info, Tree::SharedPtr t) {   
+
+		inline double Likelihood::calcInstanceLogLikelihood(InstanceInfo & info, Tree::SharedPtr t) {   
         int code = 0;
         unsigned nsubsets = (unsigned)info.subsets.size();
         assert(nsubsets > 0);
@@ -935,6 +951,7 @@ namespace strom {
 
         return log_likelihood;
     }
+
 
 	inline double Likelihood::calcLogLikelihood(Tree::SharedPtr t) {  
         assert(_instances.size() > 0);

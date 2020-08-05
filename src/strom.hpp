@@ -37,6 +37,7 @@ namespace strom {
 
             bool                   _use_gpu;
             bool                   _ambig_missing;
+            bool                   _use_underflow_scaling;
 
             static std::string     _program_name;
             static unsigned        _major_version;
@@ -55,15 +56,17 @@ namespace strom {
     } 
 
 	inline void Strom::clear() {    
-        _data_file_name = "";
-        _tree_file_name = "";
-        _tree_summary   = nullptr;
+        _data_file_name         = "";
+        _tree_file_name         = "";
+        _tree_summary           = nullptr;
         _partition.reset(new Partition());
-        _use_gpu        = true;
-        _ambig_missing  = true;
+        _use_gpu                = true;
+        _ambig_missing          = true;
 		_model.reset(new Model());
         _expected_log_likelihood = 0.0;
-        _data = nullptr;
+        _data                   = nullptr;
+        _likelihood             = nullptr;
+        _use_underflow_scaling  = false;
     }
 
 	inline void Strom::processCommandLineOptions(int argc, const char * argv[]) {  
@@ -95,6 +98,7 @@ namespace strom {
             ("expectedLnL", boost::program_options::value(&_expected_log_likelihood)->default_value(0.0), "log likelihood expected")
             ("gpu", boost::program_options::value(&_use_gpu)->default_value(true), "use GPU if available")
             ("ambigmissing",    boost::program_options::value(&_ambig_missing)->default_value(true), "treat all ambiguities as missing data")
+            ("underflowscaling",  boost::program_options::value(&_use_underflow_scaling)->default_value(false),          "scale site-likelihoods to prevent underflow (slower but safer)")
         ;
         boost::program_options::store(boost::program_options::parse_command_line(argc, argv, desc), vm);
         try {
@@ -377,6 +381,7 @@ namespace strom {
             _likelihood->setPreferGPU(_use_gpu);
             _likelihood->setAmbiguityEqualsMissing(_ambig_missing);
             _likelihood->setData(_data);
+            _likelihood->useUnderflowScaling(_use_underflow_scaling);
 
             std::cout << "\n*** Model description" << std::endl;
             std::cout << _model->describeModel() << std::endl;
